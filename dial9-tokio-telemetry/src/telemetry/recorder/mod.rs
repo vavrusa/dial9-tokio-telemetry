@@ -470,8 +470,15 @@ impl<P> TracedRuntimeBuilder<P> {
 
         let runtime = builder.build()?;
 
-        // Set metrics now that the runtime is built.
-        ctx.metrics.set(runtime.handle().metrics()).ok();
+        // Pre-reserve a contiguous block of worker IDs and set metrics atomically.
+        // Using a single OnceLock ensures resolve_worker_id never sees metrics without
+        // a valid base — eliminating the race between two separate set() calls.
+        let metrics = runtime.handle().metrics();
+        let num_workers = metrics.num_workers() as u64;
+        let base = shared
+            .next_worker_id
+            .fetch_add(num_workers, Ordering::Relaxed);
+        ctx.metrics_and_base.set((metrics, base)).ok();
 
         Ok(runtime)
     }
@@ -644,8 +651,15 @@ impl TracedRuntimeBuilder<HasTracePath> {
 
         let runtime = builder.build()?;
 
-        // Set metrics now that the runtime is built.
-        ctx.metrics.set(runtime.handle().metrics()).ok();
+        // Pre-reserve a contiguous block of worker IDs and set metrics atomically.
+        // Using a single OnceLock ensures resolve_worker_id never sees metrics without
+        // a valid base — eliminating the race between two separate set() calls.
+        let metrics = runtime.handle().metrics();
+        let num_workers = metrics.num_workers() as u64;
+        let base = shared
+            .next_worker_id
+            .fetch_add(num_workers, Ordering::Relaxed);
+        ctx.metrics_and_base.set((metrics, base)).ok();
 
         // Snapshot contexts for flush thread and TracedHandle.
         let contexts: Arc<Vec<Arc<RuntimeContext>>> = Arc::new(vec![ctx]);

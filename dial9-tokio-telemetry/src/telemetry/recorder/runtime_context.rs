@@ -19,8 +19,12 @@ pub(crate) struct RuntimeContext {
     pub runtime_index: u64,
     /// Optional human-readable name, set via `with_runtime_name`.
     pub runtime_name: Option<String>,
-    /// Set after `builder.build()` — not available when hooks are registered.
-    pub metrics: OnceLock<RuntimeMetrics>,
+    /// Set atomically after `builder.build()` once the worker count is known.
+    /// The `u64` is the pre-reserved base worker ID for this runtime:
+    ///   `worker_id = base + worker_index`
+    /// Storing them together ensures `resolve_worker_id` can never see metrics
+    /// without a valid base (eliminating a race between the two set calls).
+    pub metrics_and_base: OnceLock<(RuntimeMetrics, u64)>,
     /// Maps worker_index → global worker_id within this runtime.
     /// Populated lazily the first time each worker thread resolves its identity.
     pub worker_ids: RwLock<HashMap<usize, u64>>, // worker_index → global worker_id
@@ -31,7 +35,7 @@ impl RuntimeContext {
         Self {
             runtime_index,
             runtime_name,
-            metrics: OnceLock::new(),
+            metrics_and_base: OnceLock::new(),
             worker_ids: RwLock::new(HashMap::new()),
         }
     }
@@ -56,17 +60,17 @@ impl RuntimeContext {
 
     /// Sum of global queue depth for this runtime (0 if metrics not yet set).
     pub(crate) fn global_queue_depth(&self) -> usize {
-        self.metrics
+        self.metrics_and_base
             .get()
-            .map(|m| m.global_queue_depth())
+            .map(|(m, _)| m.global_queue_depth())
             .unwrap_or(0)
     }
 
     /// Local queue depth for a resolved worker in this runtime.
     fn local_queue_depth(&self, worker_index: usize) -> usize {
-        self.metrics
+        self.metrics_and_base
             .get()
-            .map(|m| m.worker_local_queue_depth(worker_index))
+            .map(|(m, _)| m.worker_local_queue_depth(worker_index))
             .unwrap_or(0)
     }
 }
@@ -84,14 +88,19 @@ pub(super) fn resolve_worker_id(
         if let Some(r) = cell.get() {
             return r.identity;
         }
-        let Some(m) = ctx.metrics.get() else {
-            // Metrics not yet set — leave as None so we retry next time.
+        let Some((m, base)) = ctx.metrics_and_base.get() else {
+            // Metrics/base not yet set — leave TLS as None so we retry next time.
             return None;
         };
         let tid = std::thread::current().id();
         for i in 0..m.num_workers() {
             if m.worker_thread_id(i) == Some(tid) {
-                let global_id = shared.next_worker_id.fetch_add(1, Ordering::Relaxed);
+                // ID is stable: base was pre-reserved for this runtime's full worker
+                // count at build time, so assignment is independent of resolution order.
+                let global_id = base + i as u64;
+                let _ = shared
+                    .next_worker_id
+                    .fetch_max(global_id + 1, Ordering::Relaxed);
                 let identity = WorkerIdentity {
                     worker_id: WorkerId::from(global_id as usize),
                     runtime_index: ctx.runtime_index,
