@@ -1,9 +1,12 @@
 mod event_writer;
+mod runtime_context;
 mod shared_state;
 
+pub(crate) use runtime_context::{RuntimeContext, current_worker_id};
 pub(crate) use shared_state::SharedState;
 
 use event_writer::EventWriter;
+use runtime_context::{make_poll_end, make_poll_start, make_worker_park, make_worker_unpark};
 
 use crate::metrics::{FlushMetrics, Operation};
 use crate::telemetry::buffer;
@@ -82,36 +85,49 @@ fn flush_once(event_writer: &mut EventWriter, shared: &SharedState) -> FlushStat
     }
 }
 
-/// Register telemetry callbacks on a runtime builder using the given shared state.
-/// This is the common hook registration logic used by both `install_hooks` (new
-/// telemetry session) and `install_hooks_reuse` (attaching to an existing session).
+/// Register telemetry callbacks on a runtime builder.
+/// Closures capture `Arc<RuntimeContext>` (runtime-specific) and `Arc<SharedState>` (recording core).
+///
+/// # Worker ID resolution
+///
+/// `WORKER_ID` TLS is populated lazily on the first `on_thread_unpark` / `on_before_task_poll`
+/// call via [`resolve_worker_id`](runtime_context::resolve_worker_id), not in `on_thread_start`.
+/// This is intentional: `on_thread_start` fires before `RuntimeMetrics` is available, so we
+/// cannot yet call `metrics.worker_thread_id(i)` to determine which worker index we are.
+/// By the time any waker calls `current_worker_id()`, at least one unpark or poll has occurred
+/// and TLS is guaranteed to be populated.
 fn register_hooks(
     builder: &mut tokio::runtime::Builder,
+    ctx: &Arc<RuntimeContext>,
     shared: &Arc<SharedState>,
     task_tracking_enabled: bool,
 ) {
+    let c1 = ctx.clone();
     let s1 = shared.clone();
+    let c2 = ctx.clone();
     let s2 = shared.clone();
+    let c3 = ctx.clone();
     let s3 = shared.clone();
+    let c4 = ctx.clone();
     let s4 = shared.clone();
 
     builder
         .on_thread_park(move || {
-            let event = s1.make_worker_park();
+            let event = make_worker_park(&c1, &s1);
             s1.record_event(event);
         })
         .on_thread_unpark(move || {
-            let event = s2.make_worker_unpark();
+            let event = make_worker_unpark(&c2, &s2);
             s2.record_event(event);
         })
         .on_before_task_poll(move |meta| {
             let task_id = TaskId::from(meta.id());
             let location = meta.spawned_at();
-            let event = s3.make_poll_start(location, task_id);
+            let event = make_poll_start(&c3, &s3, location, task_id);
             s3.record_event(event);
         })
         .on_after_task_poll(move |_meta| {
-            let event = s4.make_poll_end();
+            let event = make_poll_end(&c4, &s4);
             s4.record_event(event);
         });
 
@@ -173,29 +189,20 @@ fn register_hooks(
 }
 
 /// Install telemetry hooks on the runtime builder. Returns the shared state
-/// (for the hot-path callbacks) and the event writer (to be moved into the
-/// flush thread). No shared mutex is created.
+/// (for the hot-path callbacks), a fresh `RuntimeContext`, and the event writer.
 fn install_hooks(
     builder: &mut tokio::runtime::Builder,
     writer: Box<dyn TraceWriter>,
     task_tracking_enabled: bool,
     start_time_ns: u64,
-) -> (Arc<SharedState>, EventWriter) {
+    runtime_name: Option<String>,
+) -> (Arc<SharedState>, Arc<RuntimeContext>, EventWriter) {
     let shared = Arc::new(SharedState::new(start_time_ns));
-    register_hooks(builder, &shared, task_tracking_enabled);
+    let runtime_index = shared.alloc_runtime_index();
+    let ctx = Arc::new(RuntimeContext::new(runtime_index, runtime_name));
+    register_hooks(builder, &ctx, &shared, task_tracking_enabled);
     let event_writer = EventWriter::new(writer);
-    (shared, event_writer)
-}
-
-/// Install telemetry hooks on a runtime builder using an existing shared state.
-/// Does not create a new EventWriter or CPU profiler — only registers the
-/// callbacks so the new runtime's threads feed events into the existing collector.
-fn install_hooks_reuse(
-    builder: &mut tokio::runtime::Builder,
-    shared: &Arc<SharedState>,
-    task_tracking_enabled: bool,
-) {
-    register_hooks(builder, shared, task_tracking_enabled);
+    (shared, ctx, event_writer)
 }
 
 /// Cheap, cloneable handle for controlling telemetry from anywhere.
@@ -457,16 +464,14 @@ impl<P> TracedRuntimeBuilder<P> {
     ) -> std::io::Result<tokio::runtime::Runtime> {
         let shared = guard.shared().clone();
 
-        install_hooks_reuse(&mut builder, &shared, self.task_tracking_enabled);
+        let runtime_index = shared.alloc_runtime_index();
+        let ctx = Arc::new(RuntimeContext::new(runtime_index, self.runtime_name));
+        register_hooks(&mut builder, &ctx, &shared, self.task_tracking_enabled);
 
         let runtime = builder.build()?;
 
-        // Allocate a unique runtime index and register the new runtime's metrics.
-        let runtime_index = shared.alloc_runtime_index();
-        shared.register_runtime_metrics(runtime_index, runtime.handle().metrics());
-        if let Some(name) = &self.runtime_name {
-            shared.register_runtime_name(runtime_index, name.clone());
-        }
+        // Set metrics now that the runtime is built.
+        ctx.metrics.set(runtime.handle().metrics()).ok();
 
         Ok(runtime)
     }
@@ -619,11 +624,12 @@ impl TracedRuntimeBuilder<HasTracePath> {
             .sched_event_config
             .map(crate::telemetry::cpu_profile::SchedProfiler::new);
 
-        let (shared, mut event_writer) = install_hooks(
+        let (shared, ctx, mut event_writer) = install_hooks(
             &mut builder,
             writer,
             self.task_tracking_enabled,
             start_mono_ns,
+            self.runtime_name,
         );
 
         #[cfg(feature = "cpu-profiling")]
@@ -638,12 +644,11 @@ impl TracedRuntimeBuilder<HasTracePath> {
 
         let runtime = builder.build()?;
 
-        // Allocate a runtime index and register this runtime's metrics.
-        let runtime_index = shared.alloc_runtime_index();
-        shared.register_runtime_metrics(runtime_index, runtime.handle().metrics());
-        if let Some(name) = &self.runtime_name {
-            shared.register_runtime_name(runtime_index, name.clone());
-        }
+        // Set metrics now that the runtime is built.
+        ctx.metrics.set(runtime.handle().metrics()).ok();
+
+        // Snapshot contexts for flush thread and TracedHandle.
+        let contexts: Arc<Vec<Arc<RuntimeContext>>> = Arc::new(vec![ctx]);
 
         // Channel for TelemetryHandle/Guard → flush thread communication.
         // Bounded(1) so senders don't pile up commands.
@@ -651,6 +656,7 @@ impl TracedRuntimeBuilder<HasTracePath> {
 
         let thread = {
             let shared = shared.clone();
+            let contexts_flush = contexts.clone();
             let flush_metrics_sink = self
                 .worker_metrics_sink
                 .clone()
@@ -671,7 +677,7 @@ impl TracedRuntimeBuilder<HasTracePath> {
                     let sample_interval = Duration::from_millis(10);
                     let mut last_sample = Instant::now();
                     // Snapshot the user-provided segment metadata so we can
-                    // merge it with runtime names on each flush cycle.
+                    // merge it with runtime→worker entries on each flush cycle.
                     let static_metadata = event_writer.segment_metadata().to_vec();
 
                     loop {
@@ -693,17 +699,19 @@ impl TracedRuntimeBuilder<HasTracePath> {
                         let now = Instant::now();
                         if now.duration_since(last_sample) >= sample_interval {
                             last_sample = now;
-                            let runtimes = shared.metrics.load();
                             let total_global_queue: usize =
-                                runtimes.values().map(|m| m.global_queue_depth()).sum();
-                            if !runtimes.is_empty() {
+                                contexts_flush.iter().map(|c| c.global_queue_depth()).sum();
+                            if !contexts_flush.is_empty() {
                                 shared.record_queue_sample(total_global_queue);
                             }
                         }
 
                         // Merge user-provided metadata with runtime→worker mappings
                         // so the next rotated segment is fully self-describing.
-                        let runtime_entries = shared.runtime_worker_entries();
+                        let runtime_entries: Vec<(String, String)> = contexts_flush
+                            .iter()
+                            .filter_map(|c| c.metadata_entry())
+                            .collect();
                         if !runtime_entries.is_empty() {
                             let mut merged = static_metadata.clone();
                             merged.extend(runtime_entries);

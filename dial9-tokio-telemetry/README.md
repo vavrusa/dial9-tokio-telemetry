@@ -18,7 +18,7 @@ rustflags = ["--cfg", "tokio_unstable"]
 
 Without this flag, compilation will fail with errors about missing methods on `tokio::runtime::Builder` and `RuntimeMetrics`.
 
-## Quick start
+## Quick star
 
 ```rust
 use dial9_tokio_telemetry::telemetry::{RotatingWriter, TracedRuntime};
