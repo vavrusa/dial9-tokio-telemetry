@@ -1304,6 +1304,78 @@ mod tests {
         );
     }
 
+    /// Wake events from runtime B's workers must carry global worker IDs (≥ num_workers_a),
+    /// not local indices that collide with runtime A's workers.
+    #[test]
+    fn wake_events_use_global_worker_id_in_multi_runtime() {
+        use crate::telemetry::events::RawEvent;
+        use std::sync::{Arc, Mutex};
+
+        struct CapturingWriter(Arc<Mutex<Vec<RawEvent>>>);
+        impl crate::telemetry::writer::TraceWriter for CapturingWriter {
+            fn write_event(&mut self, event: &RawEvent) -> std::io::Result<()> {
+                self.0.lock().unwrap().push(event.clone());
+                Ok(())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+
+        let mut builder_a = tokio::runtime::Builder::new_multi_thread();
+        builder_a.worker_threads(2);
+        let (runtime_a, guard) = TracedRuntime::builder()
+            .with_task_tracking(true)
+            .build_and_start_with_writer(builder_a, CapturingWriter(events.clone()))
+            .unwrap();
+
+        let mut builder_b = tokio::runtime::Builder::new_multi_thread();
+        builder_b.worker_threads(2);
+        let runtime_b = TracedRuntime::builder()
+            .with_task_tracking(true)
+            .build_with_reuse(builder_b, &guard)
+            .unwrap();
+
+        // Use handle.spawn on runtime B to get Traced waker wrapping → wake events.
+        let handle = guard.handle();
+        runtime_b.block_on(async {
+            let mut handles = Vec::new();
+            for _ in 0..50 {
+                handles.push(handle.spawn(async {
+                    tokio::task::yield_now().await;
+                }));
+            }
+            for h in handles {
+                h.await.unwrap();
+            }
+        });
+
+        drop(runtime_a);
+        drop(runtime_b);
+        drop(guard);
+
+        let captured = events.lock().unwrap();
+        let wake_workers: Vec<u8> = captured
+            .iter()
+            .filter_map(|e| match e {
+                RawEvent::WakeEvent { target_worker, .. } => Some(*target_worker),
+                _ => None,
+            })
+            .collect();
+        assert!(!wake_workers.is_empty(), "expected at least one WakeEvent");
+
+        // Runtime A has workers 0,1. Runtime B has workers 2,3.
+        // Wakes issued from runtime B's workers must have target_worker >= 2.
+        let has_global_id = wake_workers.iter().any(|&w| w >= 2 && w != 255);
+        assert!(
+            has_global_id,
+            "expected wake events from runtime B to use global worker IDs (>= 2), \
+             but got: {wake_workers:?}"
+        );
+    }
+
     #[cfg(feature = "cpu-profiling")]
     mod rotation_proptest {
         use super::*;

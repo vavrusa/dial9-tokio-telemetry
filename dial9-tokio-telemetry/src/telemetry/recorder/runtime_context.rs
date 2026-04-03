@@ -2,7 +2,6 @@ use super::shared_state::{PARKED_SCHED_WAIT, SharedState};
 use crate::telemetry::events::{RawEvent, SchedStat};
 use crate::telemetry::format::WorkerId;
 use crate::telemetry::task_metadata::TaskId;
-#[cfg(feature = "cpu-profiling")]
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -25,6 +24,9 @@ pub(crate) struct RuntimeContext {
 }
 
 thread_local! {
+    /// Global worker ID for this thread, set on every `resolve_worker` call.
+    /// Read by `current_worker_id()` for wake events.
+    static GLOBAL_WORKER_ID: Cell<Option<u64>> = const { Cell::new(None) };
     /// Whether we've registered this thread's worker_id mapping.
     static WORKER_REGISTERED: Cell<bool> = const { Cell::new(false) };
     /// Whether we've registered this thread's OS tid for CPU profiling.
@@ -81,9 +83,12 @@ impl RuntimeContext {
         let (_, base) = self.metrics_and_base.get()?;
         let global_id = base + local_index as u64;
 
+        // Always update TLS so current_worker_id() returns the global ID.
+        GLOBAL_WORKER_ID.with(|cell| cell.set(Some(global_id)));
+
         register_worker_if_needed(self, local_index, global_id);
         #[cfg(feature = "cpu-profiling")]
-        register_tid_if_needed(local_index, shared);
+        register_tid_if_needed(global_id, shared);
         #[cfg(not(feature = "cpu-profiling"))]
         let _ = shared;
 
@@ -106,25 +111,28 @@ fn register_worker_if_needed(ctx: &RuntimeContext, local_index: usize, global_id
 
 /// Register the current thread's OS tid for CPU profiling (once per thread).
 #[cfg(feature = "cpu-profiling")]
-fn register_tid_if_needed(worker_index: usize, shared: &SharedState) {
+fn register_tid_if_needed(global_id: u64, shared: &SharedState) {
     TID_REGISTERED.with(|cell| {
         if !cell.get() {
             let os_tid = crate::telemetry::events::current_tid();
             shared.thread_roles.lock().unwrap().insert(
                 os_tid,
-                crate::telemetry::events::ThreadRole::Worker(worker_index),
+                crate::telemetry::events::ThreadRole::Worker(global_id as usize),
             );
             cell.set(true);
         }
     });
 }
 
-/// Get the current thread's worker index (255 = unknown).
+/// Get the current thread's global worker ID (255 = unknown).
 /// Used by the `Traced` waker to record which worker issued the wake.
 pub(crate) fn current_worker_id() -> u8 {
-    tokio::runtime::worker_index()
-        .map(|i| if i <= 254 { i as u8 } else { 255 })
-        .unwrap_or(255)
+    GLOBAL_WORKER_ID.with(|cell| {
+        cell.get()
+            // TODO: cleanly handle more than 255 global workers
+            .map(|id| if id <= 254 { id as u8 } else { 255 })
+            .unwrap_or(255)
+    })
 }
 
 // ── Event construction helpers ───────────────────────────────────────────────
