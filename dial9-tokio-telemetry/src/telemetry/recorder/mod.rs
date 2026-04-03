@@ -160,6 +160,8 @@ fn register_hooks(
             .on_thread_start(move || {
                 // Register as Blocking initially; worker threads will
                 // overwrite this to Worker(i) in resolve_worker_id.
+                // NOTE: `tokio::runtime::worker_index()` will always return `None` at this point
+                // so we can't utilize that here.
                 {
                     let tid = crate::telemetry::events::current_tid();
                     s_start
@@ -198,8 +200,7 @@ fn install_hooks(
     runtime_name: Option<String>,
 ) -> (Arc<SharedState>, Arc<RuntimeContext>, EventWriter) {
     let shared = Arc::new(SharedState::new(start_time_ns));
-    let runtime_index = shared.alloc_runtime_index();
-    let ctx = Arc::new(RuntimeContext::new(runtime_index, runtime_name));
+    let ctx = Arc::new(RuntimeContext::new(runtime_name));
     register_hooks(builder, &ctx, &shared, task_tracking_enabled);
     let event_writer = EventWriter::new(writer);
     (shared, ctx, event_writer)
@@ -464,8 +465,7 @@ impl<P> TracedRuntimeBuilder<P> {
     ) -> std::io::Result<tokio::runtime::Runtime> {
         let shared = guard.shared().clone();
 
-        let runtime_index = shared.alloc_runtime_index();
-        let ctx = Arc::new(RuntimeContext::new(runtime_index, self.runtime_name));
+        let ctx = Arc::new(RuntimeContext::new(self.runtime_name));
         register_hooks(&mut builder, &ctx, &shared, self.task_tracking_enabled);
 
         let runtime = builder.build()?;
@@ -479,6 +479,8 @@ impl<P> TracedRuntimeBuilder<P> {
             .next_worker_id
             .fetch_add(num_workers, Ordering::Relaxed);
         ctx.metrics_and_base.set((metrics, base)).ok();
+
+        shared.contexts.lock().unwrap().push(ctx);
 
         Ok(runtime)
     }
@@ -661,8 +663,9 @@ impl TracedRuntimeBuilder<HasTracePath> {
             .fetch_add(num_workers, Ordering::Relaxed);
         ctx.metrics_and_base.set((metrics, base)).ok();
 
-        // Snapshot contexts for flush thread and TracedHandle.
-        let contexts: Arc<Vec<Arc<RuntimeContext>>> = Arc::new(vec![ctx]);
+        // Register this context so the flush thread can sample its queue
+        // depth and generate runtime→worker metadata entries.
+        shared.contexts.lock().unwrap().push(ctx);
 
         // Channel for TelemetryHandle/Guard → flush thread communication.
         // Bounded(1) so senders don't pile up commands.
@@ -670,7 +673,6 @@ impl TracedRuntimeBuilder<HasTracePath> {
 
         let thread = {
             let shared = shared.clone();
-            let contexts_flush = contexts.clone();
             let flush_metrics_sink = self
                 .worker_metrics_sink
                 .clone()
@@ -713,19 +715,19 @@ impl TracedRuntimeBuilder<HasTracePath> {
                         let now = Instant::now();
                         if now.duration_since(last_sample) >= sample_interval {
                             last_sample = now;
+                            let contexts = shared.contexts.lock().unwrap().clone();
                             let total_global_queue: usize =
-                                contexts_flush.iter().map(|c| c.global_queue_depth()).sum();
-                            if !contexts_flush.is_empty() {
+                                contexts.iter().map(|c| c.global_queue_depth()).sum();
+                            if !contexts.is_empty() {
                                 shared.record_queue_sample(total_global_queue);
                             }
                         }
 
                         // Merge user-provided metadata with runtime→worker mappings
                         // so the next rotated segment is fully self-describing.
-                        let runtime_entries: Vec<(String, String)> = contexts_flush
-                            .iter()
-                            .filter_map(|c| c.metadata_entry())
-                            .collect();
+                        let contexts = shared.contexts.lock().unwrap().clone();
+                        let runtime_entries: Vec<(String, String)> =
+                            contexts.iter().filter_map(|c| c.metadata_entry()).collect();
                         if !runtime_entries.is_empty() {
                             let mut merged = static_metadata.clone();
                             merged.extend(runtime_entries);
@@ -746,8 +748,15 @@ impl TracedRuntimeBuilder<HasTracePath> {
                             }
                             .append_on_drop(flush_metrics_sink.clone());
                         }
-                        if exit && let Err(e) = event_writer.finalize() {
-                            tracing::warn!("failed to finalize trace segment: {e}");
+                        if exit {
+                            // Write final metadata before sealing so single-segment
+                            // traces contain runtime→worker mappings.
+                            if let Err(e) = event_writer.write_current_segment_metadata() {
+                                tracing::warn!("failed to write final segment metadata: {e}");
+                            }
+                            if let Err(e) = event_writer.finalize() {
+                                tracing::warn!("failed to finalize trace segment: {e}");
+                            }
                         }
                         if let Some(tx) = ack_tx.take() {
                             let _ = tx.send(());
@@ -895,6 +904,68 @@ mod tests {
     use super::*;
     use crate::telemetry::NullWriter;
     use std::panic::Location;
+
+    #[test]
+    fn current_thread_runtime_resolves_worker_ids() {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ev = events.clone();
+
+        let mut builder = tokio::runtime::Builder::new_current_thread();
+        builder.enable_all();
+
+        let writer = {
+            struct W(std::sync::Arc<std::sync::Mutex<Vec<crate::telemetry::events::RawEvent>>>);
+            impl crate::telemetry::writer::TraceWriter for W {
+                fn write_event(
+                    &mut self,
+                    event: &crate::telemetry::events::RawEvent,
+                ) -> std::io::Result<()> {
+                    self.0.lock().unwrap().push(event.clone());
+                    Ok(())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            W(ev)
+        };
+
+        let (rt, guard) = TracedRuntime::builder()
+            .build_and_start_with_writer(builder, writer)
+            .unwrap();
+
+        rt.block_on(async {
+            tokio::spawn(async {
+                tokio::task::yield_now().await;
+            })
+            .await
+            .unwrap();
+        });
+
+        drop(rt);
+        drop(guard);
+
+        let captured = events.lock().unwrap();
+        let poll_starts: Vec<_> = captured
+            .iter()
+            .filter_map(|e| match e {
+                crate::telemetry::events::RawEvent::PollStart { worker_id, .. } => Some(*worker_id),
+                _ => None,
+            })
+            .collect();
+        assert!(!poll_starts.is_empty(), "expected at least one PollStart");
+        let unknown: Vec<_> = poll_starts
+            .iter()
+            .filter(|id| **id == crate::telemetry::format::WorkerId::UNKNOWN)
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "all PollStart events should have a known worker ID, \
+             but {}/{} were UNKNOWN",
+            unknown.len(),
+            poll_starts.len()
+        );
+    }
 
     #[test]
     fn test_shared_state_no_spawn_location_fields() {
@@ -1139,6 +1210,97 @@ mod tests {
         assert!(
             has_runtime_a && has_runtime_b,
             "expected worker IDs from both runtimes (0..2 and 2..4), got: {worker_ids:?}"
+        );
+    }
+
+    /// Verify that `build_with_reuse` propagates the second runtime's metadata
+    /// (runtime name → worker ID mapping) into the trace file's segment metadata.
+    #[test]
+    fn build_with_reuse_propagates_second_runtime_metadata() {
+        use crate::telemetry::events::TelemetryEvent;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let trace_path = dir.path().join("trace.bin");
+
+        let writer = crate::telemetry::writer::RotatingWriter::builder()
+            .base_path(&trace_path)
+            .max_file_size(1024 * 1024)
+            .max_total_size(10 * 1024 * 1024)
+            .build()
+            .unwrap();
+
+        let mut builder_a = tokio::runtime::Builder::new_multi_thread();
+        builder_a.worker_threads(2);
+        let (runtime_a, guard) = TracedRuntime::builder()
+            .with_runtime_name("main")
+            .with_trace_path(trace_path.to_str().unwrap())
+            .build_and_start(builder_a, writer)
+            .unwrap();
+
+        let mut builder_b = tokio::runtime::Builder::new_multi_thread();
+        builder_b.worker_threads(2);
+        let runtime_b = TracedRuntime::builder()
+            .with_runtime_name("io")
+            .build_with_reuse(builder_b, &guard)
+            .unwrap();
+
+        // Run work on both runtimes so workers resolve their identities.
+        for rt in [&runtime_a, &runtime_b] {
+            rt.block_on(async {
+                let mut handles = Vec::new();
+                for _ in 0..20 {
+                    handles.push(tokio::spawn(async {
+                        tokio::task::yield_now().await;
+                    }));
+                }
+                for h in handles {
+                    h.await.unwrap();
+                }
+            });
+        }
+
+        // Give the flush thread time to run (it cycles every 5ms and merges
+        // runtime metadata into the writer on each cycle).
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        drop(runtime_a);
+        drop(runtime_b);
+        let _ = guard.graceful_shutdown(std::time::Duration::from_secs(5));
+
+        // Read all sealed trace files and collect SegmentMetadata entries.
+        let mut all_metadata: Vec<Vec<(String, String)>> = Vec::new();
+        let mut files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "bin"))
+            .collect();
+        files.sort();
+        for file in &files {
+            let data = std::fs::read(file).unwrap();
+            let events = crate::telemetry::format::decode_events_v2(&data).unwrap();
+            for event in &events {
+                if let TelemetryEvent::SegmentMetadata { entries, .. } = event {
+                    all_metadata.push(entries.clone());
+                }
+            }
+        }
+
+        assert!(
+            !all_metadata.is_empty(),
+            "expected at least one SegmentMetadata event in trace files"
+        );
+
+        // At least one segment's metadata should contain both runtime mappings.
+        let has_both = all_metadata.iter().any(|entries| {
+            let has_main = entries.iter().any(|(k, _)| k == "runtime.main");
+            let has_io = entries.iter().any(|(k, _)| k == "runtime.io");
+            has_main && has_io
+        });
+        assert!(
+            has_both,
+            "expected segment metadata to contain both runtime.main and runtime.io, \
+             got: {all_metadata:?}"
         );
     }
 

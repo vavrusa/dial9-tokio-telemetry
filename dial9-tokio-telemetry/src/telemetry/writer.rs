@@ -39,6 +39,12 @@ pub trait TraceWriter: Send {
     /// Replace the segment metadata entries that will be written into the next
     /// rotated segment (e.g. merged static + runtime names). Default is a no-op.
     fn update_segment_metadata(&mut self, _entries: Vec<(String, String)>) {}
+    /// Write a `SegmentMetadataEvent` into the current segment. Called before
+    /// finalize so that single-segment traces contain runtime→worker mappings.
+    /// Default is a no-op.
+    fn write_current_segment_metadata(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 impl<W: TraceWriter + ?Sized> TraceWriter for Box<W> {
@@ -62,6 +68,9 @@ impl<W: TraceWriter + ?Sized> TraceWriter for Box<W> {
     }
     fn update_segment_metadata(&mut self, entries: Vec<(String, String)>) {
         (**self).update_segment_metadata(entries)
+    }
+    fn write_current_segment_metadata(&mut self) -> std::io::Result<()> {
+        (**self).write_current_segment_metadata()
     }
 }
 
@@ -479,6 +488,10 @@ impl TraceWriter for RotatingWriter {
 
     fn update_segment_metadata(&mut self, entries: Vec<(String, String)>) {
         self.segment_metadata = entries;
+    }
+
+    fn write_current_segment_metadata(&mut self) -> std::io::Result<()> {
+        self.write_segment_metadata()
     }
 
     fn finalize(&mut self) -> std::io::Result<()> {

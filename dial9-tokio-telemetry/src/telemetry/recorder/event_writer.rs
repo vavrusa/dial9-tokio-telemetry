@@ -110,6 +110,10 @@ impl EventWriter {
         self.writer.update_segment_metadata(entries);
     }
 
+    pub(crate) fn write_current_segment_metadata(&mut self) -> std::io::Result<()> {
+        self.writer.write_current_segment_metadata()
+    }
+
     pub(crate) fn flush(&mut self) -> std::io::Result<()> {
         self.writer.flush()
     }
